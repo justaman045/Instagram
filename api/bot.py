@@ -1,15 +1,12 @@
-# api/bot.py
-
 import os
 import re
-import json
 import logging
 from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     ContextTypes,
     MessageHandler,
     filters,
@@ -20,14 +17,10 @@ from db.supabase_client import supabase
 # ======================================================
 # CONFIG
 # ======================================================
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")  # optional
-
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("telegram-webhook")
+log = logging.getLogger("telegram-bot")
 
 # ======================================================
 # MARKDOWN V2 SAFETY
@@ -35,8 +28,7 @@ log = logging.getLogger("telegram-webhook")
 def md_escape(text: str) -> str:
     if not text:
         return ""
-    escape_chars = r"\_*[]()~`>#+-=|{}.!"
-    return "".join("\\" + c if c in escape_chars else c for c in text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 # ======================================================
 # HELPERS
@@ -81,9 +73,9 @@ def clear_session(chat_id: str):
     supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
 # ======================================================
-# MESSAGE HANDLER
+# MAIN HANDLER
 # ======================================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
@@ -99,6 +91,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if session and session.get("stage") == "project":
         payload = session["payload"]
         projects = payload["projects"]
+        ig = payload["ig"]
 
         try:
             idx = int(text) - 1
@@ -109,8 +102,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             return
-
-        ig = payload["ig"]
 
         row = (
             supabase
@@ -148,7 +139,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --------------------------------------------------
-    # NEW MESSAGE → TRY IG USERNAME
+    # NEW MESSAGE → IG USERNAME
     # --------------------------------------------------
     ig = extract_ig_username(text)
     if not ig:
@@ -207,45 +198,15 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled bot error", exc_info=context.error)
 
 # ======================================================
-# TELEGRAM APPLICATION (GLOBAL, SINGLE)
+# START BOT (RENDER / POLLING)
 # ======================================================
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
-telegram_app.add_error_handler(on_error)
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
-# ======================================================
-# ENSURE APP STARTED (CRITICAL FOR WEBHOOKS)
-# ======================================================
-_started = False
+    log.info("🤖 Telegram bot started (polling)")
+    app.run_polling()
 
-async def _ensure_started():
-    global _started
-    if not _started:
-        await telegram_app.initialize()
-        await telegram_app.start()
-        _started = True
-
-# ======================================================
-# VERCEL SERVERLESS ENTRYPOINT
-# ======================================================
-async def handler(request):
-    # Health check
-    if request.method == "GET":
-        return {"statusCode": 200, "body": "OK"}
-
-    # Optional webhook secret verification
-    if WEBHOOK_SECRET:
-        secret = request.headers.get("x-telegram-bot-api-secret-token")
-        if secret != WEBHOOK_SECRET:
-            return {"statusCode": 403}
-
-    body = await request.body()
-
-    await _ensure_started()
-
-    update = Update.de_json(json.loads(body), telegram_app.bot)
-    await telegram_app.process_update(update)
-
-    return {"statusCode": 200}
+if __name__ == "__main__":
+    main()
