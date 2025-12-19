@@ -1,15 +1,17 @@
+# api/bot.py
+
 import os
 import re
 import json
 import logging
-from flask import Flask, request, jsonify
+from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -18,34 +20,40 @@ from db.supabase_client import supabase
 # ======================================================
 # CONFIG
 # ======================================================
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")  # optional
+
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("telegram-webhook")
 
 # ======================================================
-# TELEGRAM APPLICATION (GLOBAL, NO POLLING)
-# ======================================================
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-# ======================================================
-# MARKDOWN ESCAPE (MarkdownV2)
+# MARKDOWN V2 SAFETY
 # ======================================================
 def md_escape(text: str) -> str:
-    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", text or "")
+    if not text:
+        return ""
+    escape_chars = r"\_*[]()~`>#+-=|{}.!"
+    return "".join("\\" + c if c in escape_chars else c for c in text)
 
 # ======================================================
 # HELPERS
 # ======================================================
-def extract_ig_username(text: str):
+def extract_ig_username(text: str) -> Optional[str]:
+    text = text.strip()
+
     if "instagram.com" in text:
         m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)", text)
         return m.group(1) if m else None
+
     if text.startswith("@"):
         return text[1:]
+
     if re.fullmatch(r"[A-Za-z0-9_.]+", text):
         return text
+
     return None
 
 # ======================================================
@@ -53,7 +61,8 @@ def extract_ig_username(text: str):
 # ======================================================
 def get_session(chat_id: str):
     return (
-        supabase.table("telegram_sessions")
+        supabase
+        .table("telegram_sessions")
         .select("*")
         .eq("chat_id", chat_id)
         .maybe_single()
@@ -104,7 +113,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ig = payload["ig"]
 
         row = (
-            supabase.table("monitored_accounts")
+            supabase
+            .table("monitored_accounts")
             .select("id, ig_username")
             .eq("project_id", project["id"])
             .maybe_single()
@@ -116,7 +126,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             supabase.table("monitored_accounts").insert({
                 "project_id": project["id"],
                 "ig_username": ig,
-                "is_active": True,
             }).execute()
         else:
             existing = [
@@ -139,14 +148,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --------------------------------------------------
-    # NEW MESSAGE → IG USERNAME
+    # NEW MESSAGE → TRY IG USERNAME
     # --------------------------------------------------
     ig = extract_ig_username(text)
     if not ig:
         return
 
     telegram_account = (
-        supabase.table("telegram_accounts")
+        supabase
+        .table("telegram_accounts")
         .select("user_id")
         .eq("chat_id", chat_id)
         .maybe_single()
@@ -162,7 +172,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     projects = (
-        supabase.table("projects")
+        supabase
+        .table("projects")
         .select("id,name")
         .eq("user_id", telegram_account["user_id"])
         .eq("active", True)
@@ -195,27 +206,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled bot error", exc_info=context.error)
 
+# ======================================================
+# TELEGRAM APPLICATION (GLOBAL, SINGLE)
+# ======================================================
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
 )
 telegram_app.add_error_handler(on_error)
 
 # ======================================================
-# FLASK APP (VERCEL SAFE)
+# ENSURE APP STARTED (CRITICAL FOR WEBHOOKS)
 # ======================================================
-app = Flask(__name__)
+_started = False
 
-@app.route("/api/bot", methods=["GET", "POST"])
-def webhook():
+async def _ensure_started():
+    global _started
+    if not _started:
+        await telegram_app.initialize()
+        await telegram_app.start()
+        _started = True
+
+# ======================================================
+# VERCEL SERVERLESS ENTRYPOINT
+# ======================================================
+async def handler(request):
+    # Health check
     if request.method == "GET":
-        return "OK", 200
+        return {"statusCode": 200, "body": "OK"}
 
+    # Optional webhook secret verification
     if WEBHOOK_SECRET:
         secret = request.headers.get("x-telegram-bot-api-secret-token")
         if secret != WEBHOOK_SECRET:
-            return "Forbidden", 403
+            return {"statusCode": 403}
 
-    update = Update.de_json(request.json, telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
+    body = await request.body()
 
-    return jsonify({"ok": True})
+    await _ensure_started()
+
+    update = Update.de_json(json.loads(body), telegram_app.bot)
+    await telegram_app.process_update(update)
+
+    return {"statusCode": 200}
