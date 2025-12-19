@@ -12,9 +12,9 @@ from dateutil.parser import isoparse
 from instagram.fetch import fetch_reels
 from db.supabase_client import supabase
 
-# ==========================
+# ======================================================
 # LOGGING
-# ==========================
+# ======================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -22,34 +22,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor")
 
-# ==========================
-# SILENCE NOISY LIBRARIES
-# ==========================
-for lib in ["httpx", "httpcore", "postgrest", "supabase", "urllib3"]:
+# Silence noisy libs
+for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
     logging.getLogger(lib).setLevel(logging.WARNING)
 
-# ==========================
-# CONFIG
-# ==========================
-DEV_MODE = os.getenv("ENV", "dev") != "prod"
+# ======================================================
+# GLOBAL SAFETY LIMITS (CRITICAL)
+# ======================================================
+MAX_REQUESTS_PER_HOUR = 120          # HARD CAP
+BATCH_SIZE = 30                      # accounts per mini-session
+BATCH_COOLDOWN_RANGE = (900, 1800)   # 15–30 min
+SESSION_COOLDOWN_RANGE = (3600, 7200)  # 1–2 hours
+MAX_PROJECT_RUNTIME_MIN = 45         # stop even if work remains
 
+# ======================================================
+# SNAPSHOT / PRUNING CONFIG
+# ======================================================
 SNAPSHOT_RETENTION = 6
+MIN_VIEW_DELTA = 20
 MIN_VIEWS_PER_HOUR = 5
 
-# Snapshot rules
-MIN_VIEW_DELTA = 20
-MAX_SNAPSHOT_INTERVAL_HOURS = 6
-
-# 🔥 Pruning rules
 MAX_INACTIVE_DAYS = 2
 MAX_REEL_AGE_DAYS = 5
 MIN_TOTAL_VIEWS = 100
 
-FETCH_SLEEP_RANGE = (1.5, 3.0) if DEV_MODE else (6.0, 10.0)
-
-# ==========================
+# ======================================================
 # TIME HELPERS
-# ==========================
+# ======================================================
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -57,9 +56,9 @@ def parse_ts(ts: str) -> datetime:
     dt = isoparse(ts)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-# ==========================
+# ======================================================
 # USERNAME NORMALIZATION
-# ==========================
+# ======================================================
 def normalize_usernames(rows: List[dict]) -> List[str]:
     seen, result = set(), []
     for row in rows:
@@ -70,9 +69,9 @@ def normalize_usernames(rows: List[dict]) -> List[str]:
                 result.append(u)
     return result
 
-# ==========================
+# ======================================================
 # SNAPSHOT HELPERS
-# ==========================
+# ======================================================
 def get_snapshots(project_id: str, reel_url: str, limit=2):
     return (
         supabase.table("reel_snapshots")
@@ -101,7 +100,7 @@ def should_insert_snapshot(project_id: str, reel_url: str, reel: Dict) -> bool:
     if dv >= MIN_VIEW_DELTA or dl > 0 or dc > 0:
         return True
 
-    if mins_since >= MAX_SNAPSHOT_INTERVAL_HOURS * 60:
+    if mins_since >= 360:  # 6 hours
         return True
 
     return False
@@ -121,21 +120,19 @@ def trim_snapshots(project_id: str, reel_url: str):
         ids = [r["id"] for r in rows[SNAPSHOT_RETENTION:]]
         supabase.table("reel_snapshots").delete().in_("id", ids).execute()
 
-# ==========================
-# 🔥 PRUNING LOGIC (FIX)
-# ==========================
+# ======================================================
+# PRUNING LOGIC
+# ======================================================
 def should_prune_reel(project_id: str, reel: dict) -> bool:
     reel_url = reel["reel_url"]
-
     snaps = get_snapshots(project_id, reel_url, limit=2)
 
-    # Rule A — inactive for too long
+    # A — inactive too long
     last_seen = parse_ts(reel["last_seen_at"])
     if now_utc() - last_seen > timedelta(days=MAX_INACTIVE_DAYS):
-        log.info("🧹 Prune: inactive too long")
         return True
 
-    # Rule B — low growth rate
+    # B — low growth rate
     if len(snaps) >= 2:
         cur, prev = snaps
         hours = max(
@@ -145,21 +142,22 @@ def should_prune_reel(project_id: str, reel: dict) -> bool:
         )
         vph = (cur["views"] - prev["views"]) / hours
         if vph < MIN_VIEWS_PER_HOUR:
-            log.info("🧹 Prune: low growth rate")
             return True
 
-    # Rule C — old + low total views
+    # C — old & weak
     age_days = (now_utc() - parse_ts(reel["last_seen_at"])).days
     if age_days >= MAX_REEL_AGE_DAYS and reel["views"] < MIN_TOTAL_VIEWS:
-        log.info("🧹 Prune: old & underperforming")
         return True
 
     return False
 
-# ==========================
-# MAIN JOB
-# ==========================
+# ======================================================
+# MAIN MONITOR JOB (SAFE)
+# ======================================================
 def run_monitor(project_id: Optional[str] = None):
+    start_time = time.time()
+    requests_this_run = 0
+
     log.info("🛰️ Monitor job started")
 
     query = supabase.table("projects").select("*")
@@ -169,6 +167,10 @@ def run_monitor(project_id: Optional[str] = None):
     total_reels = total_snaps = total_pruned = 0
 
     for project in projects:
+        if (time.time() - start_time) / 60 > MAX_PROJECT_RUNTIME_MIN:
+            log.warning("⏹️ Max runtime reached — stopping safely")
+            break
+
         pid = project["id"]
         log.info(f"📁 Project: {project['name']}")
 
@@ -181,13 +183,22 @@ def run_monitor(project_id: Optional[str] = None):
         )
 
         usernames = normalize_usernames(rows)
-        if not usernames:
-            continue
+        random.shuffle(usernames)
+
+        batch_count = 0
 
         for username in usernames:
+            if requests_this_run >= MAX_REQUESTS_PER_HOUR:
+                cooldown = random.uniform(*SESSION_COOLDOWN_RANGE)
+                log.warning(f"🛑 Hourly cap hit — cooling {cooldown:.0f}s")
+                time.sleep(cooldown)
+                return  # END RUN SAFELY
+
             try:
                 log.info(f"🔍 Fetching {username}")
                 reels = fetch_reels(username)
+                requests_this_run += 1
+                batch_count += 1
             except Exception:
                 log.exception(f"Fetch failed @{username}")
                 continue
@@ -226,9 +237,14 @@ def run_monitor(project_id: Optional[str] = None):
 
                 trim_snapshots(pid, reel_url)
 
-            time.sleep(random.uniform(*FETCH_SLEEP_RANGE))
+            # 🔁 BATCH COOLDOWN
+            if batch_count >= BATCH_SIZE:
+                cooldown = random.uniform(*BATCH_COOLDOWN_RANGE)
+                log.info(f"😴 Batch cooldown {cooldown:.0f}s")
+                time.sleep(cooldown)
+                batch_count = 0
 
-        # 🔥 FINAL PRUNE PASS (important!)
+        # 🔥 FINAL PRUNE PASS
         all_reels = (
             supabase.table("reels")
             .select("*")

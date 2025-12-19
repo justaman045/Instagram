@@ -1,14 +1,13 @@
+# telegram/bot.py
+
 import os
 import re
-import json
 import logging
-from typing import Optional
+from typing import Dict, List
 
-from fastapi import FastAPI, Request, Response
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     ContextTypes,
     MessageHandler,
     filters,
@@ -16,194 +15,247 @@ from telegram.ext import (
 
 from db.supabase_client import supabase
 
-# ======================================================
-# CONFIG
-# ======================================================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+# ==========================
+# LOGGING
+# ==========================
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("telegram-bot")
 
+# Silence noisy libraries
+for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
+    logging.getLogger(lib).setLevel(logging.WARNING)
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("telegram-webhook")
+# ==========================
+# IN-MEMORY STATE
+# ==========================
+PENDING: Dict[str, dict] = {}
 
-# ======================================================
-# MARKDOWN SAFETY
-# ======================================================
-def md_escape(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
-
-# ======================================================
+# ==========================
 # HELPERS
-# ======================================================
-def extract_ig_username(text: str) -> Optional[str]:
+# ==========================
+def extract_ig_username(text: str) -> str | None:
     text = text.strip()
+
     if "instagram.com" in text:
         m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)", text)
         return m.group(1) if m else None
+
     if text.startswith("@"):
         return text[1:]
+
     if re.fullmatch(r"[A-Za-z0-9_.]+", text):
         return text
+
     return None
 
-# ======================================================
-# SUPABASE SESSION HELPERS
-# ======================================================
-def get_session(chat_id: str):
-    return (
-        supabase.table("telegram_sessions")
-        .select("*")
-        .eq("chat_id", chat_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
 
-def save_session(chat_id: str, stage: str, payload: dict):
-    supabase.table("telegram_sessions").upsert({
-        "chat_id": chat_id,
-        "stage": stage,
-        "payload": payload,
-    }).execute()
+async def reply_project_list(message, ig: str, projects: List[dict]):
+    reply = f"Which project do you want to add @{ig} to?\n\n"
+    for i, p in enumerate(projects, 1):
+        reply += f"{i}. {p['name']}\n"
+    await message.reply_text(reply)
 
-def clear_session(chat_id: str):
-    supabase.table("telegram_sessions").delete().eq("chat_id", chat_id).execute()
 
-# ======================================================
-# TELEGRAM HANDLER
-# ======================================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==========================
+# MAIN HANDLER
+# ==========================
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg or not msg.text:
-        return
-
-    chat_id = str(msg.chat.id)
+    telegram_user_id = str(msg.from_user.id)
     text = msg.text.strip()
 
-    session = get_session(chat_id)
-
-    # ---------------- PROJECT SELECTION ----------------
-    if session and session.get("stage") == "project":
-        payload = session["payload"]
-        projects = payload["projects"]
+    # ======================================================
+    # STAGE 1 — ACCOUNT SELECTION
+    # ======================================================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "user":
+        state = PENDING[telegram_user_id]
 
         try:
             idx = int(text) - 1
-            project = projects[idx]
+            selected = state["accounts"][idx]
         except Exception:
-            await msg.reply_text(
-                "❌ Invalid selection\\. Try again\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await msg.reply_text("❌ Invalid selection. Try again.")
             return
 
-        ig = payload["ig"]
+        state["user_id"] = selected["user_id"]
+        state["projects"] = selected["projects"]
+        state["stage"] = "project"
 
+        await reply_project_list(msg, state["ig_username"], selected["projects"])
+        return
+
+    # ======================================================
+    # STAGE 2 — PROJECT SELECTION
+    # ======================================================
+    if telegram_user_id in PENDING and PENDING[telegram_user_id]["stage"] == "project":
+        state = PENDING[telegram_user_id]
+
+        try:
+            idx = int(text) - 1
+            project = state["projects"][idx]
+        except Exception:
+            await msg.reply_text("❌ Invalid selection. Try again.")
+            return
+
+        ig = state["ig_username"]
+
+        # ---------------------------------------------
+        # FETCH EXISTING MONITORED_ACCOUNTS ROW
+        # ---------------------------------------------
         row = (
-            supabase.table("monitored_accounts")
+            supabase
+            .table("monitored_accounts")
             .select("id, ig_username")
             .eq("project_id", project["id"])
-            .maybe_single()
+            .single()
             .execute()
             .data
         )
 
+        # ---------------------------------------------
+        # NO ROW → CREATE
+        # ---------------------------------------------
         if not row:
             supabase.table("monitored_accounts").insert({
                 "project_id": project["id"],
                 "ig_username": ig,
+                "is_active": True,
             }).execute()
+
+            await msg.reply_text(
+                f"✅ @{ig} added to *{project['name']}*",
+                parse_mode="Markdown",
+            )
+
+        # ---------------------------------------------
+        # ROW EXISTS → APPEND
+        # ---------------------------------------------
         else:
-            existing = [u.strip() for u in (row.get("ig_username") or "").split(",") if u.strip()]
-            if ig not in existing:
+            existing = [
+                u.strip()
+                for u in (row["ig_username"] or "").split(",")
+                if u.strip()
+            ]
+
+            if ig in existing:
+                await msg.reply_text(
+                    f"⚠️ @{ig} already exists in *{project['name']}*",
+                    parse_mode="Markdown",
+                )
+            else:
                 existing.append(ig)
+                updated = ", ".join(existing)
+
                 supabase.table("monitored_accounts").update({
-                    "ig_username": ", ".join(existing)
+                    "ig_username": updated
                 }).eq("id", row["id"]).execute()
 
-        await msg.reply_text(
-            f"✅ *@{md_escape(ig)}* added to *{md_escape(project['name'])}*",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+                await msg.reply_text(
+                    f"✅ @{ig} added to *{project['name']}*",
+                    parse_mode="Markdown",
+                )
 
-        clear_session(chat_id)
+        del PENDING[telegram_user_id]
         return
 
-    # ---------------- NEW IG USERNAME ----------------
-    ig = extract_ig_username(text)
-    if not ig:
+    # ======================================================
+    # NEW MESSAGE → TRY IG USERNAME
+    # ======================================================
+    ig_username = extract_ig_username(text)
+    if not ig_username:
         return
 
-    telegram_account = (
-        supabase.table("telegram_accounts")
+    # ------------------------------------------------------
+    # Resolve Telegram → Supabase users
+    # ------------------------------------------------------
+    telegram_accounts = (
+        supabase
+        .table("telegram_accounts")
         .select("user_id")
-        .eq("chat_id", chat_id)
-        .maybe_single()
+        .eq("chat_id", telegram_user_id)
         .execute()
         .data
     )
 
-    if not telegram_account:
-        await msg.reply_text(
-            "❌ Please complete setup first\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+    if not telegram_accounts:
+        await msg.reply_text("❌ Please complete setup first.")
         return
 
-    projects = (
-        supabase.table("projects")
-        .select("id,name")
-        .eq("user_id", telegram_account["user_id"])
-        .eq("active", True)
-        .execute()
-        .data
-    )
+    # ------------------------------------------------------
+    # Build labeled accounts
+    # ------------------------------------------------------
+    accounts = []
 
-    if not projects:
-        await msg.reply_text(
-            "❌ No active projects found\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+    for row in telegram_accounts:
+        projects = (
+            supabase
+            .table("projects")
+            .select("id,name,destination_instagram")
+            .eq("user_id", row["user_id"])
+            .eq("active", True)
+            .execute()
+            .data
         )
+
+        if not projects:
+            continue
+
+        dest = projects[0].get("destination_instagram") or "unknown"
+        label = f"@{dest} ({len(projects)} project{'s' if len(projects) > 1 else ''})"
+
+        accounts.append({
+            "user_id": row["user_id"],
+            "projects": projects,
+            "label": label,
+        })
+
+    if not accounts:
+        await msg.reply_text("❌ No active projects found.")
         return
 
-    reply = f"Choose a project for *@{md_escape(ig)}*:\n\n"
-    for i, p in enumerate(projects, 1):
-        reply += f"{i}\\. {md_escape(p['name'])}\n"
+    # ======================================================
+    # MULTIPLE ACCOUNTS
+    # ======================================================
+    if len(accounts) > 1:
+        PENDING[telegram_user_id] = {
+            "ig_username": ig_username,
+            "accounts": accounts,
+            "stage": "user",
+        }
 
-    save_session(chat_id, "project", {"ig": ig, "projects": projects})
-    await msg.reply_text(reply, parse_mode=ParseMode.MARKDOWN_V2)
+        reply = f"Multiple accounts found.\nWhich account should manage @{ig_username}?\n\n"
+        for i, acc in enumerate(accounts, 1):
+            reply += f"{i}. {acc['label']}\n"
 
-# ======================================================
-# FASTAPI + TELEGRAM APP
-# ======================================================
-app = FastAPI()
+        await msg.reply_text(reply)
+        return
 
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-telegram_app.add_handler(
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-)
+    # ======================================================
+    # SINGLE ACCOUNT → PROJECT PICK
+    # ======================================================
+    PENDING[telegram_user_id] = {
+        "ig_username": ig_username,
+        "user_id": accounts[0]["user_id"],
+        "projects": accounts[0]["projects"],
+        "stage": "project",
+    }
 
-@app.on_event("startup")
-async def startup():
-    log.info("Initializing Telegram application...")
-    await telegram_app.initialize()
+    await reply_project_list(msg, ig_username, accounts[0]["projects"])
 
-@app.post("/api/bot")
-async def telegram_webhook(request: Request):
-    if WEBHOOK_SECRET:
-        secret = request.headers.get("x-telegram-bot-api-secret-token")
-        if secret != WEBHOOK_SECRET:
-            return Response(status_code=403)
 
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return Response(status_code=200)
+# ==========================
+# START BOT
+# ==========================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT, on_message))
+    log.info("🤖 Telegram bot started")
+    app.run_polling()
 
-@app.get("/")
-async def health():
-    return {"status": "alive"}
+
+if __name__ == "__main__":
+    main()
