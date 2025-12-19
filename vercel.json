@@ -1,3 +1,13 @@
 {
-  "version": 2
+  "functions": {
+    "api/bot.py": {
+      "runtime": "python@3.10"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/bot",
+      "dest": "/api/bot.py"
+    }
+  ]
 }
