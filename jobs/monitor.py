@@ -29,7 +29,7 @@ for lib in ("httpx", "httpcore", "postgrest", "supabase", "urllib3"):
 # GLOBAL SAFETY LIMITS (CRITICAL)
 # ======================================================
 MAX_REQUESTS_PER_HOUR = 120          # HARD CAP
-BATCH_SIZE = 30                      # accounts per mini-session
+BATCH_SIZE = 5                      # accounts per mini-session
 BATCH_COOLDOWN_RANGE = (900, 1800)   # 15–30 min
 SESSION_COOLDOWN_RANGE = (3600, 7200)  # 1–2 hours
 MAX_PROJECT_RUNTIME_MIN = 45         # stop even if work remains
@@ -203,6 +203,8 @@ def run_monitor(project_id: Optional[str] = None):
                         f"⏭️ skipped @{username} due to response being blocked by Instagram"
                     )
                     continue
+                else:
+                    time.sleep(60)
 
                 requests_this_run += 1
                 batch_count += 1
