@@ -14,7 +14,7 @@ from tgram.send import send_message
 # ==========================
 # CONFIG
 # ==========================
-DEV_MODE = False  # set True only for local testing
+DEV_MODE = True  # set True only for local testing
 
 # ==========================
 # LOGGING
@@ -45,12 +45,17 @@ def is_delivery_due(settings: dict) -> bool:
     tz = pytz.timezone(settings["timezone"])
     now_local = utc_now().astimezone(tz)
 
+
     delivery_time = now_local.replace(
         hour=settings["send_hour"],
         minute=0,
         second=0,
         microsecond=0,
     )
+
+    log.info(now_local)
+    log.info(delivery_time)
+    log.info(now_local >= delivery_time)
 
     return now_local >= delivery_time
 

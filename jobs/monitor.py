@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 from dateutil.parser import isoparse
 
-from instagram.fetch import fetch_reels, is_blocked
+from instagram.fetch import fetch_reels
 from db.supabase_client import supabase
 
 # ======================================================
@@ -156,6 +156,7 @@ def should_prune_reel(project_id: str, reel: dict) -> bool:
 def run_monitor(project_id: Optional[str] = None):
     start_time = time.time()
     requests_this_run = 0
+    blocked = False
 
     log.info("🛰️ Monitor job started")
 
@@ -191,7 +192,9 @@ def run_monitor(project_id: Optional[str] = None):
                 cooldown = random.uniform(*SESSION_COOLDOWN_RANGE)
                 log.warning(f"🛑 Hourly cap hit — cooling {cooldown:.0f}s")
                 time.sleep(cooldown)
-                return  # END RUN SAFELY
+                blocked = True
+                break
+
 
             try:
                 log.info(f"🔍 Fetching {username}")
@@ -202,9 +205,13 @@ def run_monitor(project_id: Optional[str] = None):
                     log.warning(
                         f"⏭️ skipped @{username} due to response being blocked by Instagram"
                     )
-                    continue
+                    blocked = True
+                    break
+                elif reels == []:
+                    log.info(f"ℹ️ No reels found @{username}")
                 else:
-                    time.sleep(60)
+                    if not blocked:
+                        time.sleep(60)
 
                 requests_this_run += 1
                 batch_count += 1
@@ -254,9 +261,9 @@ def run_monitor(project_id: Optional[str] = None):
                 time.sleep(cooldown)
                 batch_count = 0
         
-        if is_blocked():
-            log.error("🚫 Instagram blocked — stopping monitor run safely")
-            return
+        if blocked:
+            log.error("🚫 Instagram blocked Partially Completed — stopping monitor run safely")
+            break
 
         # 🔥 FINAL PRUNE PASS
         all_reels = (

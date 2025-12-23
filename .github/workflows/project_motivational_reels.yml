@@ -1,8 +1,8 @@
-name: Girls and Lust and Dance and Cuteness – Automation
+name: Motivational Reels – Automation
 
 on:
   schedule:
-    - cron: "0 */7 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -26,14 +26,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python cli.py monitor --project 1
+          python cli.py monitor --project 2
 
       - name: Run analyze
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python cli.py analyze --project 1
+          python cli.py analyze --project 2
 
       - name: Run deliver
         env:
@@ -41,4 +41,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python cli.py deliver --project 1
+          python cli.py deliver --project 2

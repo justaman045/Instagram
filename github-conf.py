@@ -2,7 +2,6 @@
 
 import os
 import sys
-from datetime import datetime
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -17,15 +16,9 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-
 # ======================================================
 # HELPERS
 # ======================================================
-
-def ist_to_utc(hour_ist: int) -> int:
-    """Convert IST hour (0–23) to UTC hour"""
-    return (hour_ist - 5) % 24
-
 
 def slugify(name: str) -> str:
     return (
@@ -50,7 +43,6 @@ def fetch_projects_in_db_order():
         .data
         or []
     )
-
     return rows
 
 
@@ -89,30 +81,23 @@ def main():
     print(f"📌 CLI index: {project_index}")
 
     interval_hours = int(
-        input("⏱️  Run monitor every how many hours? (e.g. 6): ")
+        input("⏱️  Run automation every how many hours? (e.g. 6): ")
     )
 
-    deliver_hour_ist = int(
-        input("📤 Deliver reels at what hour IST? (0–23): ")
-    )
-
-    deliver_hour_utc = ist_to_utc(deliver_hour_ist)
+    # ======================================================
+    # WORKFLOW TEMPLATE
+    # ======================================================
 
     workflow = f"""
 name: {project_name} – Automation
 
 on:
   schedule:
-    # Monitor + Analyze every {interval_hours} hours
     - cron: "0 */{interval_hours} * * *"
-
-    # Deliver daily at {deliver_hour_ist}:00 IST
-    - cron: "0 {deliver_hour_utc} * * *"
-
   workflow_dispatch:
 
 jobs:
-  monitor_analyze:
+  automation:
     runs-on: ubuntu-latest
 
     steps:
@@ -141,22 +126,7 @@ jobs:
         run: |
           python cli.py analyze --project {project_index}
 
-  deliver:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Deliver reels
+      - name: Run deliver
         env:
           TELEGRAM_BOT_TOKEN: ${{{{ secrets.TELEGRAM_BOT_TOKEN }}}}
           SUPABASE_URL: ${{{{ secrets.SUPABASE_URL }}}}
@@ -175,7 +145,7 @@ jobs:
     print(f"👉 {path}")
     print("\n📌 Next steps:")
     print("1. git add .github/workflows/")
-    print("2. git commit -m \"Add automation for project index {project_index}\"")
+    print(f"2. git commit -m \"Add automation for project {project_name}\"")
     print("3. git push")
 
 
